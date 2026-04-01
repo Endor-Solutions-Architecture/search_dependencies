@@ -1,6 +1,6 @@
 # Endor Labs Dependency Search Tool
 
-This repository contains a Python script for searching dependencies using the Endor Labs API. The script finds which projects use specific dependencies across all accessible namespaces.
+This repository contains a Python script for searching dependencies using the Endor Labs API. The script finds which projects use specific dependencies under `ENDOR_NAMESPACE` and all of its child namespaces.
 
 ### Prerequisites
 
@@ -28,7 +28,7 @@ This repository contains a Python script for searching dependencies using the En
 
 ### Dependency Search (`search_dependencies.py`)
 
-Searches for specific dependencies across all accessible namespaces and finds which projects use them. The script searches only the main context and outputs results to the terminal, JSON, and CSV formats.
+Searches for specific dependencies under your configured namespace and all child namespaces, and finds which projects use them. The script searches only the main context and outputs results to the terminal, JSON, and CSV formats.
 
 #### Examples
 
@@ -60,7 +60,7 @@ The script generates timestamped output files:
 
 #### Features
 
-- **Cross-namespace search**: Automatically searches all accessible namespaces using the `--traverse` parameter
+- **Cross-namespace search**: Lists namespace FQDNs under `ENDOR_NAMESPACE` (ListNamespaces subtree traverse), then queries **DependencyMetadata per namespace FQDN** with no `traverse` on the query. Each row uses the FQDN from the URL path
 - **Main context only**: Focuses on production dependencies (excludes test/dev contexts)
 - **Multiple output formats**: Terminal display, JSON, and CSV
 - **Detailed results**: Includes project name (with git URL), dependency scope, and parent package version information
