@@ -6,10 +6,11 @@ Script to search for dependencies and find which projects use them.
 import argparse
 import json
 import os
+import stat
 import sys
 import csv
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
 from dotenv import load_dotenv
 import requests
 
@@ -36,26 +37,57 @@ def get_env_values():
         "initial_namespace": initial_namespace
     }
 
-def get_token(api_key, api_secret):
-    """Get API token using API key and secret."""
-    url = f"{API_URL}/auth/api-key"
-    payload = {
-        "key": api_key,
-        "secret": api_secret
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Request-Timeout": "60"
-    }
+TOKEN_REFRESH_MARGIN_SECONDS = 60
 
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=600)
-        response.raise_for_status()
-        token = response.json().get('token')
-        return token
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to get token: {e}")
-        sys.exit(1)
+
+class TokenManager:
+    """Handles API token lifecycle: fetch, cache, and auto-refresh before expiry."""
+
+    def __init__(self, api_key, api_secret):
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._token = None
+        self._expires_at = 0
+
+    def _fetch_token(self):
+        url = f"{API_URL}/auth/api-key"
+        payload = {"key": self._api_key, "secret": self._api_secret}
+        headers = {"Content-Type": "application/json", "Request-Timeout": "60"}
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=600)
+            response.raise_for_status()
+            data = response.json()
+            self._token = data.get("token")
+            expiry = data.get("expiration_time")
+            if expiry:
+                import time as _time
+                try:
+                    self._expires_at = int(
+                        datetime.fromisoformat(
+                            expiry.replace("Z", "+00:00")
+                        ).timestamp()
+                    )
+                except (ValueError, TypeError):
+                    self._expires_at = int(_time.time()) + 3600
+            else:
+                import time as _time
+                self._expires_at = int(_time.time()) + 3600
+            if not self._token:
+                print("ERROR: API returned empty token.")
+                sys.exit(1)
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to get token: {type(e).__name__}")
+            sys.exit(1)
+
+    @property
+    def token(self):
+        import time as _time
+        if (
+            self._token is None
+            or _time.time() >= self._expires_at - TOKEN_REFRESH_MARGIN_SECONDS
+        ):
+            self._fetch_token()
+        return self._token
 
 
 def parse_dependency(dependency_str):
@@ -111,17 +143,13 @@ def _namespace_fqn_from_list_object(obj, root_namespace):
     return None
 
 
-def collect_namespace_fqdns(token, root_namespace):
+def collect_namespace_fqdns(token_mgr, root_namespace):
     """
     List fully qualified namespace names under root_namespace (ListNamespaces API,
     subtree traverse). Shown for reference before the dependency query.
     """
     encoded = urllib.parse.quote(root_namespace, safe="")
     url = f"{API_URL}/namespaces/{encoded}/namespaces"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Request-Timeout": "600",
-    }
     discovered = {root_namespace}
     next_page_token = None
     while True:
@@ -132,6 +160,10 @@ def collect_namespace_fqdns(token, root_namespace):
         if next_page_token is not None:
             params["list_parameters.page_token"] = str(next_page_token)
         try:
+            headers = {
+                "Authorization": f"Bearer {token_mgr.token}",
+                "Request-Timeout": "600",
+            }
             response = requests.get(url, headers=headers, params=params, timeout=600)
             response.raise_for_status()
             data = response.json()
@@ -144,9 +176,7 @@ def collect_namespace_fqdns(token, root_namespace):
             if not next_page_token:
                 break
         except requests.exceptions.RequestException as e:
-            print(f"Failed to list namespaces under {root_namespace!r}: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                print(f"Response: {e.response.text}")
+            print(f"Failed to list namespaces under {root_namespace!r}: {type(e).__name__}: {e.response.status_code if hasattr(e, 'response') and e.response is not None else str(e)}")
             break
 
     rest = sorted(ns for ns in discovered if ns != root_namespace)
@@ -160,18 +190,13 @@ def collect_namespace_fqdns(token, root_namespace):
     return ordered
 
 
-def _query_dependency_in_namespace(token, namespace_fqdn, dependency_info):
+def _query_dependency_in_namespace(token_mgr, namespace_fqdn, dependency_info):
     """
     POST .../namespaces/{namespace_fqdn}/queries for DependencyMetadata (no traverse).
     Project join also without traverse — scoped to the same namespace.
     """
     encoded = urllib.parse.quote(namespace_fqdn, safe="")
     url = f"{API_URL}/namespaces/{encoded}/queries"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Request-Timeout": "600",
-    }
 
     query_payload = {
         "meta": {
@@ -216,6 +241,11 @@ def _query_dependency_in_namespace(token, namespace_fqdn, dependency_info):
 
         try:
             print(f"  Page {page_num}...")
+            headers = {
+                "Authorization": f"Bearer {token_mgr.token}",
+                "Content-Type": "application/json",
+                "Request-Timeout": "600",
+            }
             response = requests.post(url, headers=headers, json=query_payload, timeout=600)
             response.raise_for_status()
 
@@ -273,15 +303,13 @@ def _query_dependency_in_namespace(token, namespace_fqdn, dependency_info):
             page_num += 1
 
         except requests.exceptions.RequestException as e:
-            print(f"  Failed querying {namespace_fqdn!r}: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                print(f"  Response: {e.response.text}")
+            print(f"  Failed querying {namespace_fqdn!r}: {type(e).__name__}: {e.response.status_code if hasattr(e, 'response') and e.response is not None else str(e)}")
             break
 
     return results
 
 
-def search_dependency_usage(token, root_namespace, dependency_info):
+def search_dependency_usage(token_mgr, root_namespace, dependency_info):
     """
     1. ListNamespaces (subtree traverse) to discover all FQDNs.
     2. For each FQDN, POST DependencyMetadata query with no traverse, using the
@@ -291,7 +319,7 @@ def search_dependency_usage(token, root_namespace, dependency_info):
         f"\nSearching {dependency_info['full_name']}@{dependency_info['version']} "
         f"across all namespaces under {root_namespace!r}..."
     )
-    ordered_fqdns = collect_namespace_fqdns(token, root_namespace)
+    ordered_fqdns = collect_namespace_fqdns(token_mgr, root_namespace)
 
     combined = []
     for fqn in ordered_fqdns:
@@ -300,22 +328,32 @@ def search_dependency_usage(token, root_namespace, dependency_info):
             f"{dependency_info['full_name']}@{dependency_info['version']}"
         )
         combined.extend(
-            _query_dependency_in_namespace(token, fqn, dependency_info)
+            _query_dependency_in_namespace(token_mgr, fqn, dependency_info)
         )
     return combined
 
 
-def save_results_json(results, filename):
-    """Save results to JSON file."""
+def _write_file_restricted(filename, write_fn):
+    """Write a file and set permissions to owner-only (0600)."""
+    fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
     try:
-        with open(filename, 'w') as f:
-            json.dump(results, f, indent=2)
+        with os.fdopen(fd, "w") as f:
+            write_fn(f)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def save_results_json(results, filename):
+    """Save results to JSON file (owner-only permissions)."""
+    try:
+        _write_file_restricted(filename, lambda f: json.dump(results, f, indent=2))
         print(f"Results saved to JSON: {filename}")
     except Exception as e:
         print(f"Error saving JSON file: {e}")
 
 def save_results_csv(results, filename):
-    """Save results to CSV file."""
+    """Save results to CSV file (owner-only permissions)."""
     if not results:
         print("No results to save to CSV")
         return
@@ -338,13 +376,13 @@ def save_results_csv(results, filename):
         fieldnames = [c for c in preferred if c in extras]
         fieldnames.extend(sorted(c for c in extras if c not in fieldnames))
 
-        with open(filename, 'w', newline='') as f:
+        def write_csv(f):
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            
             for result in results:
                 writer.writerow(result)
-        
+
+        _write_file_restricted(filename, write_csv)
         print(f"Results saved to CSV: {filename}")
     except Exception as e:
         print(f"Error saving CSV file: {e}")
@@ -432,17 +470,13 @@ Examples:
     # Get environment values
     env = get_env_values()
     
-    # Get API token
-    token = get_token(env["api_key"], env["api_secret"])
-    if not token:
-        print("Failed to get API token.")
-        sys.exit(1)
+    token_mgr = TokenManager(env["api_key"], env["api_secret"])
     
     # Search for each dependency
     all_results = {}
     
     for dep_info in dependencies:
-        results = search_dependency_usage(token, env["initial_namespace"], dep_info)
+        results = search_dependency_usage(token_mgr, env["initial_namespace"], dep_info)
         all_results[f"{dep_info['full_name']}@{dep_info['version']}"] = results
         
         # Display results for this dependency
